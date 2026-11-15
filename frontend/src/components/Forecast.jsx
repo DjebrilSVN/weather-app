@@ -1,55 +1,71 @@
 import React from "react";
-import { getWeatherIcon } from "./CurrentWeather.jsx";
+import { WeatherIcon } from "./CurrentWeather.jsx";
+
+const RainDropIcon = () => (
+    <svg
+        width="13"
+        height="13"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        style={{ display: "inline-block", verticalAlign: "middle", marginRight: "4px" }}
+    >
+        <path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z" />
+    </svg>
+);
 
 function formatDayName(dateString, index) {
-  if (index === 0) return "Today";
-  const date = new Date(dateString + "T12:00:00");
-  return date.toLocaleDateString(undefined, { weekday: "short" });
+    if (index === 0) return "Today";
+    const date = new Date(dateString + "T12:00:00");
+    return date.toLocaleDateString(undefined, { weekday: "short" });
 }
 
 function formatDate(dateString) {
-  const date = new Date(dateString + "T12:00:00");
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const date = new Date(dateString + "T12:00:00");
+    return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 export default function Forecast({ forecast }) {
-  if (!forecast || !forecast.days || forecast.days.length === 0) return null;
+    if (!forecast || !forecast.days || forecast.days.length === 0) return null;
 
-  return (
-    <div className="card forecast-card">
-      <div className="card-header">
-        <h3 className="card-title">📅 5-Day Weather Forecast</h3>
-        <span className="card-subtitle">Daily projections &amp; precipitation</span>
-      </div>
-
-      <div className="forecast-grid">
-        {forecast.days.map((day, index) => {
-          const icon = getWeatherIcon(day.weather_code);
-          return (
-            <div key={day.date} className="forecast-day-item">
-              <div className="forecast-day-header">
-                <span className="day-name">{formatDayName(day.date, index)}</span>
-                <span className="day-date">{formatDate(day.date)}</span>
-              </div>
-
-              <div className="forecast-icon">{icon}</div>
-
-              <div className="forecast-condition">{day.condition}</div>
-
-              <div className="forecast-temps">
-                <span className="max-temp">{Math.round(day.max_temp)}°</span>
-                <span className="min-temp">{Math.round(day.min_temp)}°</span>
-              </div>
-
-              {day.rain_chance !== null && (
-                <div className="forecast-rain">
-                  <span>🌧️ {day.rain_chance}%</span>
+    return (
+        <div className="card forecast-card">
+            <div className="card-top">
+                <div>
+                    <span className="badge">Outlook</span>
+                    <h3 className="section-title">5-Day Weather Forecast</h3>
                 </div>
-              )}
             </div>
-          );
-        })}
-      </div>
-    </div>
-  );
+
+            <div className="forecast-grid">
+                {forecast.days.map((day, index) => (
+                    <div key={day.date} className="forecast-item">
+                        <div className="forecast-day-name">{formatDayName(day.date, index)}</div>
+                        <div className="forecast-date">{formatDate(day.date)}</div>
+
+                        <div className="forecast-icon">
+                            <WeatherIcon code={day.weather_code} size={36} />
+                        </div>
+
+                        <div className="forecast-condition">{day.condition}</div>
+
+                        <div className="forecast-temps">
+                            <span className="temp-high">{Math.round(day.max_temp)}°</span>
+                            <span className="temp-low">{Math.round(day.min_temp)}°</span>
+                        </div>
+
+                        {day.rain_chance > 0 && (
+                            <div className="forecast-rain">
+                                <RainDropIcon />
+                                <span>{day.rain_chance}%</span>
+                            </div>
+                        )}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
 }
