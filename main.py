@@ -1,11 +1,17 @@
 """
-Weather App - PM Accelerator AI Engineer Intern Technical Assessment #2 (Backend)
+Weather Application - Full Stack Assessment (Frontend #1 & Backend #2)
 Author: Chennoufi Djebril
+Organization: PM Accelerator AI Engineer Assessment
 
-Stack: Python, FastAPI, SQLite, Open-Meteo (weather + geocoding),
-       OpenStreetMap Nominatim (zip codes / landmarks / reverse geocoding),
-       Wikipedia REST API (extra info). No API keys required.
+Tech Stack:
+- FastAPI (REST API framework)
+- SQLite (relational database for data persistence)
+- Open-Meteo API (weather forecasts & geocoding - free, no API key required)
+- OpenStreetMap Nominatim (geocoding fallback for postal codes & landmarks)
+- Wikipedia REST API (location enrichment)
+- FPDF2 (PDF export generation)
 """
+
 import csv
 import io
 import json
@@ -15,81 +21,89 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import date, timedelta
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fpdf import FPDF
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Weather App", description="Weather CRUD API by Chennoufi Djebril")
+# ==============================================================================
+# 1. APP CONFIGURATION & CORS SETUP
+# ==============================================================================
 
-# Allow the React frontend (Vite dev server) to call this API
+app = FastAPI(
+    title="Weather App API",
+    description="Full Stack Weather Application built by Chennoufi Djebril for PM Accelerator",
+    version="1.0.0",
+)
+
+# Enable CORS so the React frontend (running on Vite or another port) can call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-WEATHER_CODES = {
-    0: "Clear sky", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
-    45: "Fog", 48: "Freezing fog",
-    51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
-    56: "Freezing drizzle", 57: "Heavy freezing drizzle",
-    61: "Light rain", 63: "Rain", 65: "Heavy rain",
-    66: "Freezing rain", 67: "Heavy freezing rain",
-    71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow grains",
-    80: "Light showers", 81: "Showers", 82: "Violent showers",
-    85: "Snow showers", 86: "Heavy snow showers",
-    95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Severe thunderstorm with hail",
+DB_FILE = "weather.db"
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org"
+NOMINATIM_HEADERS = {
+    "User-Agent": "WeatherApp-ChennoufiDjebril/1.0 (https://github.com/DjebrilSVN/weather-app)"
 }
 
-
-def describe(code) -> str:
-    return WEATHER_CODES.get(code, "Unknown")
-
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
-NOMINATIM = "https://nominatim.openstreetmap.org"
-HEADERS = {"User-Agent": "WeatherInternProject/1.0 (https://github.com/DjebrilSVN/weather-app)"}
-DB_FILE = "weather.db"
-# Require either a comma/semicolon separator or a decimal point so space-separated postal codes (e.g. "110 00") aren't treated as coordinates
-COORD_RE = re.compile(
+# Coordinate pattern: supports "35.69, -0.63" or "35.69 -0.63"
+COORD_REGEX = re.compile(
     r"^\s*(?:(-?\d{1,3}\.\d+)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)|(-?\d{1,3}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?))\s*$"
 )
 
-_nominatim_lock = threading.Lock()
-_last_nominatim_time = 0.0
-_location_cache = {}
-_cache_lock = threading.Lock()
+# Standard WMO Weather interpretation codes
+WMO_WEATHER_CODES = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    71: "Slight snow fall",
+    73: "Moderate snow fall",
+    75: "Heavy snow fall",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
 
 
-def _nominatim_get(path: str, params: dict) -> httpx.Response:
-    """Make a request to Nominatim adhering to its usage policy (max 1 req/sec)."""
-    global _last_nominatim_time
-    with _nominatim_lock:
-        elapsed = time.time() - _last_nominatim_time
-        if elapsed < 1.0:
-            time.sleep(1.0 - elapsed)
-        resp = httpx.get(
-            f"{NOMINATIM}{path}",
-            params=params,
-            headers=HEADERS,
-            timeout=10,
-        )
-        _last_nominatim_time = time.time()
-        return resp
+def get_weather_description(code: Optional[int]) -> str:
+    """Map WMO numeric weather code to a human-readable condition."""
+    if code is None:
+        return "Unknown"
+    return WMO_WEATHER_CODES.get(code, "Cloudy")
 
 
-# ---------------------------------------------------------------- Database
+# ==============================================================================
+# 2. DATABASE MANAGEMENT (SQLite)
+# ==============================================================================
+
 @contextmanager
 def get_db():
+    """Context manager for SQLite connections with row-dict access."""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     try:
@@ -100,18 +114,20 @@ def get_db():
 
 
 def init_db():
+    """Initialize the SQLite database schema if not present."""
     with get_db() as db:
         db.execute(
             """
-            CREATE TABLE IF NOT EXISTS records (
+            CREATE TABLE IF NOT EXISTS weather_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 location TEXT NOT NULL,
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
                 start_date TEXT NOT NULL,
                 end_date TEXT NOT NULL,
-                temps TEXT NOT NULL,
-                note TEXT DEFAULT ''
+                temps_json TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -120,482 +136,602 @@ def init_db():
 init_db()
 
 
-def row_to_dict(row) -> dict:
-    rec = dict(row)
-    rec["temps"] = json.loads(rec["temps"])
-    return rec
+def record_row_to_dict(row: sqlite3.Row) -> dict:
+    """Helper to convert an SQLite row to a clean serializable dictionary."""
+    data = dict(row)
+    data["temps"] = json.loads(data["temps_json"])
+    del data["temps_json"]
+    return data
 
 
-# ----------------------------------------------------------------- Helpers
-def find_location(query: str) -> dict:
-    """Resolve user input (coordinates, city, town, zip code, landmark) to a real place."""
+# ==============================================================================
+# 3. LOCATION & GEOCODING RESOLVER
+# ==============================================================================
+
+# Thread safety lock & cache to respect Nominatim's 1-request-per-second policy
+_nominatim_lock = threading.Lock()
+_last_nominatim_request_time = 0.0
+_geocoding_cache = {}
+_cache_lock = threading.Lock()
+
+
+def resolve_location(query: str) -> dict:
+    """
+    Resolves user input into latitude, longitude, and a clean display name.
+    Supports:
+    1. GPS Coordinates (e.g. '35.69, -0.63')
+    2. City or Town names (via Open-Meteo Geocoding)
+    3. Postal / Zip codes, Landmarks, and Addresses (via Nominatim)
+    """
     query = query.strip()
     if not query:
-        raise HTTPException(400, "Location cannot be empty.")
+        raise HTTPException(status_code=400, detail="Location query cannot be empty.")
 
     cache_key = query.lower()
     with _cache_lock:
-        if cache_key in _location_cache:
-            return dict(_location_cache[cache_key])
+        if cache_key in _geocoding_cache:
+            return dict(_geocoding_cache[cache_key])
 
-    # 1) GPS coordinates, e.g. "35.69, -0.63"
-    m = COORD_RE.match(query)
-    if m:
-        lat_s = m.group(1) or m.group(3)
-        lon_s = m.group(2) or m.group(4)
-        lat, lon = float(lat_s), float(lon_s)
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            raise HTTPException(400, "Coordinates are out of range.")
-        label = f"{lat}, {lon}"
-        try:
-            r = _nominatim_get(
-                "/reverse",
-                params={"lat": lat, "lon": lon, "format": "jsonv2"},
-            )
-            if r.status_code == 200:
-                label = r.json().get("display_name", label)
-        except httpx.HTTPError:
-            pass  # label is cosmetic; continue with raw coordinates
+    # Check 1: GPS Coordinates
+    coord_match = COORD_REGEX.match(query)
+    if coord_match:
+        lat_str = coord_match.group(1) or coord_match.group(3)
+        lon_str = coord_match.group(2) or coord_match.group(4)
+        lat, lon = float(lat_str), float(lon_str)
+
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise HTTPException(status_code=400, detail="Latitude must be [-90, 90] and Longitude [-180, 180].")
+
+        label = f"{lat:.4f}, {lon:.4f}"
         result = {"latitude": lat, "longitude": lon, "label": label}
         with _cache_lock:
-            _location_cache[cache_key] = result
-        return dict(result)
+            _geocoding_cache[cache_key] = result
+        return result
 
-    # 2) Cities and towns (Open-Meteo geocoding, handles fuzzy matches)
+    # Check 2: City / Town via Open-Meteo Geocoding (fast fuzzy search)
     try:
-        r = httpx.get(GEOCODE_URL, params={"name": query, "count": 1}, timeout=10)
-        r.raise_for_status()
-        results = r.json().get("results")
-    except httpx.HTTPError:
-        raise HTTPException(502, "Location service is unavailable, try again later.")
-    if results:
-        p = results[0]
-        label = ", ".join(x for x in [p.get("name"), p.get("admin1"), p.get("country")] if x)
-        result = {"latitude": p["latitude"], "longitude": p["longitude"], "label": label}
-        with _cache_lock:
-            _location_cache[cache_key] = result
-        return dict(result)
-
-    # 3) Fallback: zip/postal codes, landmarks, addresses (OpenStreetMap)
-    try:
-        r = _nominatim_get(
-            "/search",
-            params={"q": query, "format": "jsonv2", "limit": 1},
+        res = httpx.get(
+            OPEN_METEO_GEOCODE_URL,
+            params={"name": query, "count": 1, "language": "en"},
+            timeout=8.0,
         )
-        r.raise_for_status()
-        hits = r.json()
+        if res.status_code == 200:
+            hits = res.json().get("results")
+            if hits:
+                top = hits[0]
+                parts = [top.get("name"), top.get("admin1"), top.get("country")]
+                label = ", ".join([p for p in parts if p])
+                result = {
+                    "latitude": float(top["latitude"]),
+                    "longitude": float(top["longitude"]),
+                    "label": label,
+                }
+                with _cache_lock:
+                    _geocoding_cache[cache_key] = result
+                return result
     except httpx.HTTPError:
-        raise HTTPException(502, "Location service is unavailable, try again later.")
-    if not hits:
-        raise HTTPException(404, f"Could not find a location called '{query}'.")
-    h = hits[0]
-    result = {"latitude": float(h["lat"]), "longitude": float(h["lon"]), "label": h["display_name"]}
-    with _cache_lock:
-        _location_cache[cache_key] = result
-    return dict(result)
+        pass  # Fall back to Nominatim below
+
+    # Check 3: Fallback via OpenStreetMap Nominatim (for zip codes & landmarks)
+    global _last_nominatim_request_time
+    with _nominatim_lock:
+        elapsed = time.time() - _last_nominatim_request_time
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+        try:
+            res = httpx.get(
+                f"{NOMINATIM_URL}/search",
+                params={"q": query, "format": "jsonv2", "limit": 1},
+                headers=NOMINATIM_HEADERS,
+                timeout=10.0,
+            )
+            _last_nominatim_request_time = time.time()
+            if res.status_code == 200:
+                hits = res.json()
+                if hits:
+                    top = hits[0]
+                    result = {
+                        "latitude": float(top["lat"]),
+                        "longitude": float(top["lon"]),
+                        "label": top.get("display_name", query),
+                    }
+                    with _cache_lock:
+                        _geocoding_cache[cache_key] = result
+                    return result
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Geocoding service unavailable. Please try again.")
+
+    raise HTTPException(status_code=404, detail=f"Location '{query}' could not be found.")
 
 
-def validate_dates(start: date, end: date):
+# ==============================================================================
+# 4. DATE VALIDATION & WEATHER FETCHING
+# ==============================================================================
+
+def validate_date_range(start_date: date, end_date: date):
+    """
+    Enforces business rules for date inputs:
+    - end_date cannot precede start_date.
+    - Max range duration is 31 days.
+    - Dates must be within past 90 days to next 15 days (API availability).
+    """
     today = date.today()
-    if end < start:
-        raise HTTPException(400, "end_date cannot be before start_date.")
-    if (end - start).days > 30:
-        raise HTTPException(400, "Date range cannot be longer than 31 days.")
-    if start < today - timedelta(days=90) or end > today + timedelta(days=15):
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="End date cannot be earlier than start date.")
+
+    if (end_date - start_date).days > 31:
+        raise HTTPException(status_code=400, detail="Date range cannot exceed 31 days.")
+
+    min_allowed = today - timedelta(days=90)
+    max_allowed = today + timedelta(days=15)
+
+    if start_date < min_allowed or end_date > max_allowed:
         raise HTTPException(
-            400, "Dates must be within the last 90 days and the next 15 days."
+            status_code=400,
+            detail=f"Dates must be between {min_allowed.isoformat()} and {max_allowed.isoformat()}.",
         )
 
 
-def fetch_daily_temps(lat: float, lon: float, start: date, end: date) -> list:
+def fetch_daily_temperatures(lat: float, lon: float, start_date: date, end_date: date) -> List[dict]:
+    """Retrieves real daily high/low temperatures from Open-Meteo for a given date range."""
     try:
-        r = httpx.get(
-            FORECAST_URL,
+        res = httpx.get(
+            OPEN_METEO_FORECAST_URL,
             params={
                 "latitude": lat,
                 "longitude": lon,
                 "daily": "temperature_2m_max,temperature_2m_min",
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
                 "timezone": "auto",
             },
-            timeout=10,
+            timeout=10.0,
         )
-        r.raise_for_status()
+        res.raise_for_status()
     except httpx.HTTPError:
-        raise HTTPException(502, "Weather service is unavailable, try again later.")
-    d = r.json()["daily"]
+        raise HTTPException(status_code=502, detail="Failed to fetch weather data from external API.")
+
+    data = res.json().get("daily", {})
+    dates = data.get("time", [])
+    max_temps = data.get("temperature_2m_max", [])
+    min_temps = data.get("temperature_2m_min", [])
+
     return [
-        {"date": t, "max": mx, "min": mn}
-        for t, mx, mn in zip(d["time"], d["temperature_2m_max"], d["temperature_2m_min"])
+        {"date": d, "max_temp": mx, "min_temp": mn}
+        for d, mx, mn in zip(dates, max_temps, min_temps)
     ]
 
 
-# ------------------------------------------------------------------ Models
-class RecordIn(BaseModel):
-    location: str
-    start_date: date
-    end_date: date
+# ==============================================================================
+# 5. PYDANTIC SCHEMAS (REQUEST / RESPONSE MODELS)
+# ==============================================================================
+
+class RecordCreateRequest(BaseModel):
+    location: str = Field(..., description="City, landmark, zip code, or GPS coordinates")
+    start_date: date = Field(..., description="Start date (YYYY-MM-DD)")
+    end_date: date = Field(..., description="End date (YYYY-MM-DD)")
+    note: Optional[str] = Field(default="", description="Optional travel or weather note")
 
 
-class RecordUpdate(BaseModel):
+class RecordUpdateRequest(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     note: Optional[str] = None
 
 
-# --------------------------------------------------------- Current weather
-@app.get("/weather")
-def current_weather(location: str):
-    place = find_location(location)
+# ==============================================================================
+# 6. API ROUTES - WEATHER & FORECAST (TECH ASSESSMENT #1)
+# ==============================================================================
+
+@app.get("/weather", summary="Get Current Weather")
+def get_current_weather(location: str = Query(..., description="Location to search")):
+    """
+    Returns real-time weather information:
+    - Temperature, Relative Humidity, Wind Speed, Weather Condition
+    - Location name and coordinates
+    """
+    loc = resolve_location(location)
     try:
-        r = httpx.get(
-            FORECAST_URL,
+        res = httpx.get(
+            OPEN_METEO_FORECAST_URL,
             params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "current": (
-                    "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,"
-                    "precipitation,rain,weather_code,surface_pressure,"
-                    "wind_speed_10m,wind_direction_10m,wind_gusts_10m,dew_point_2m,uv_index"
-                ),
-                "daily": (
-                    "temperature_2m_max,temperature_2m_min,sunrise,sunset,"
-                    "uv_index_max,precipitation_sum,precipitation_probability_max"
-                ),
-                "forecast_days": 1,
+                "latitude": loc["latitude"],
+                "longitude": loc["longitude"],
+                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
                 "timezone": "auto",
             },
-            timeout=10,
+            timeout=10.0,
         )
-        r.raise_for_status()
+        res.raise_for_status()
     except httpx.HTTPError:
-        raise HTTPException(502, "Weather service is unavailable, try again later.")
+        raise HTTPException(status_code=502, detail="Could not reach weather provider.")
 
-    payload = r.json()
-    current = payload["current"]
-    current["description"] = describe(current.get("weather_code"))
-
-    daily = payload.get("daily", {})
-    today = {
-        "max": daily.get("temperature_2m_max", [None])[0],
-        "min": daily.get("temperature_2m_min", [None])[0],
-        "sunrise": daily.get("sunrise", [None])[0],
-        "sunset": daily.get("sunset", [None])[0],
-        "uv_max": daily.get("uv_index_max", [None])[0],
-        "rain_sum": daily.get("precipitation_sum", [None])[0],
-        "rain_chance": daily.get("precipitation_probability_max", [None])[0],
-    }
-
-    air_quality = None
-    try:
-        aq = httpx.get(
-            AIR_QUALITY_URL,
-            params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "current": "us_aqi,european_aqi,pm2_5,pm10",
-            },
-            timeout=8,
-        )
-        if aq.status_code == 200:
-            air_quality = aq.json().get("current")
-    except httpx.HTTPError:
-        pass  # air quality is supplementary; never fail weather request
+    current_data = res.json().get("current", {})
+    code = current_data.get("weather_code")
 
     return {
-        "location": place["label"],
-        "latitude": place["latitude"],
-        "longitude": place["longitude"],
-        "timezone": payload.get("timezone"),
-        "current": current,
-        "today": today,
-        "air_quality": air_quality,
+        "location": loc["label"],
+        "latitude": loc["latitude"],
+        "longitude": loc["longitude"],
+        "temperature": current_data.get("temperature_2m"),
+        "humidity": current_data.get("relative_humidity_2m"),
+        "wind_speed": current_data.get("wind_speed_10m"),
+        "weather_code": code,
+        "condition": get_weather_description(code),
+        "time": current_data.get("time"),
     }
 
 
-@app.get("/forecast")
-def five_day_forecast(location: str):
-    """5-day daily + hourly forecast for any location input (city, zip, landmark, coordinates)."""
-    place = find_location(location)
+@app.get("/forecast", summary="Get 5-Day Weather Forecast")
+def get_five_day_forecast(location: str = Query(..., description="Location to search")):
+    """Returns a 5-day daily forecast with high/low temperatures, conditions, and rain chance."""
+    loc = resolve_location(location)
     try:
-        r = httpx.get(
-            FORECAST_URL,
+        res = httpx.get(
+            OPEN_METEO_FORECAST_URL,
             params={
-                "latitude": place["latitude"],
-                "longitude": place["longitude"],
-                "daily": (
-                    "weather_code,temperature_2m_max,temperature_2m_min,"
-                    "precipitation_probability_max,precipitation_sum,uv_index_max,sunrise,sunset"
-                ),
-                "hourly": (
-                    "temperature_2m,relative_humidity_2m,precipitation_probability,"
-                    "precipitation,weather_code,uv_index,is_day"
-                ),
+                "latitude": loc["latitude"],
+                "longitude": loc["longitude"],
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
                 "forecast_days": 5,
                 "timezone": "auto",
             },
-            timeout=10,
+            timeout=10.0,
         )
-        r.raise_for_status()
+        res.raise_for_status()
     except httpx.HTTPError:
-        raise HTTPException(502, "Weather service is unavailable, try again later.")
+        raise HTTPException(status_code=502, detail="Could not reach weather provider.")
 
-    payload = r.json()
-    d = payload["daily"]
-    days = []
-    for i, day in enumerate(d["time"]):
-        days.append({
-            "date": day,
-            "weather_code": d["weather_code"][i],
-            "description": describe(d["weather_code"][i]),
-            "max": d["temperature_2m_max"][i],
-            "min": d["temperature_2m_min"][i],
-            "rain_chance": d["precipitation_probability_max"][i],
-            "rain_sum": d["precipitation_sum"][i],
-            "uv_max": d["uv_index_max"][i],
-            "sunrise": d["sunrise"][i],
-            "sunset": d["sunset"][i],
-        })
+    daily = res.json().get("daily", {})
+    times = daily.get("time", [])
+    codes = daily.get("weather_code", [])
+    maxs = daily.get("temperature_2m_max", [])
+    mins = daily.get("temperature_2m_min", [])
+    rains = daily.get("precipitation_probability_max", [])
 
-    h = payload.get("hourly", {})
-    hourly = []
-    for i, ts in enumerate(h.get("time", [])):
-        code = h["weather_code"][i]
-        hourly.append({
-            "time": ts,
-            "temp": h["temperature_2m"][i],
-            "humidity": h["relative_humidity_2m"][i],
-            "rain_chance": h["precipitation_probability"][i],
-            "rain_mm": h["precipitation"][i],
+    forecast_days = []
+    for i in range(len(times)):
+        code = codes[i] if i < len(codes) else None
+        forecast_days.append({
+            "date": times[i],
+            "max_temp": maxs[i] if i < len(maxs) else None,
+            "min_temp": mins[i] if i < len(mins) else None,
+            "rain_chance": rains[i] if i < len(rains) else None,
             "weather_code": code,
-            "description": describe(code),
-            "uv_index": h["uv_index"][i],
-            "is_day": h["is_day"][i],
+            "condition": get_weather_description(code),
         })
 
-    return {"location": place["label"], "days": days, "hourly": hourly}
+    return {
+        "location": loc["label"],
+        "latitude": loc["latitude"],
+        "longitude": loc["longitude"],
+        "days": forecast_days,
+    }
 
 
-# -------------------------------------------------------------------- CRUD
-@app.post("/records", status_code=201)
-def create_record(body: RecordIn):
-    validate_dates(body.start_date, body.end_date)
-    place = find_location(body.location)
-    temps = fetch_daily_temps(
-        place["latitude"], place["longitude"], body.start_date, body.end_date
+# ==============================================================================
+# 7. API ROUTES - CRUD OPERATIONS (TECH ASSESSMENT #2.1)
+# ==============================================================================
+
+@app.post("/records", status_code=201, summary="CREATE Weather Record")
+def create_weather_record(payload: RecordCreateRequest):
+    """
+    CREATE: Validates location and date range, fetches daily temperature data,
+    and stores the record into the SQLite database.
+    """
+    validate_date_range(payload.start_date, payload.end_date)
+    loc = resolve_location(payload.location)
+    daily_temps = fetch_daily_temperatures(
+        loc["latitude"], loc["longitude"], payload.start_date, payload.end_date
     )
+
     with get_db() as db:
-        cur = db.execute(
-            "INSERT INTO records (location, latitude, longitude, start_date, end_date, temps) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+        cursor = db.execute(
+            """
+            INSERT INTO weather_records (location, latitude, longitude, start_date, end_date, temps_json, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
             (
-                place["label"],
-                place["latitude"],
-                place["longitude"],
-                body.start_date.isoformat(),
-                body.end_date.isoformat(),
-                json.dumps(temps),
+                loc["label"],
+                loc["latitude"],
+                loc["longitude"],
+                payload.start_date.isoformat(),
+                payload.end_date.isoformat(),
+                json.dumps(daily_temps),
+                payload.note or "",
             ),
         )
-        row = db.execute("SELECT * FROM records WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return row_to_dict(row)
+        record_id = cursor.lastrowid
+        row = db.execute("SELECT * FROM weather_records WHERE id = ?", (record_id,)).fetchone()
+
+    return record_row_to_dict(row)
 
 
-@app.get("/records")
-def list_records():
+@app.get("/records", summary="READ All Weather Records")
+def get_all_records():
+    """READ: Retrieves all persisted weather records (newest first)."""
     with get_db() as db:
-        rows = db.execute("SELECT * FROM records ORDER BY id DESC").fetchall()
-    return [row_to_dict(r) for r in rows]
+        rows = db.execute("SELECT * FROM weather_records ORDER BY id DESC").fetchall()
+    return [record_row_to_dict(row) for row in rows]
 
 
-@app.get("/records/{record_id}")
-def get_record(record_id: int):
+@app.get("/records/{record_id}", summary="READ One Weather Record")
+def get_single_record(record_id: int):
+    """READ: Retrieves a single record by its ID."""
     with get_db() as db:
-        row = db.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
+        row = db.execute("SELECT * FROM weather_records WHERE id = ?", (record_id,)).fetchone()
     if not row:
-        raise HTTPException(404, "Record not found.")
-    return row_to_dict(row)
+        raise HTTPException(status_code=404, detail="Weather record not found.")
+    return record_row_to_dict(row)
 
 
-@app.put("/records/{record_id}")
-def update_record(record_id: int, body: RecordUpdate):
+@app.put("/records/{record_id}", summary="UPDATE Weather Record")
+def update_weather_record(record_id: int, payload: RecordUpdateRequest):
+    """
+    UPDATE: Allows updating notes or date ranges.
+    If dates are modified, validates them and refreshes daily temperatures to maintain consistency.
+    """
     with get_db() as db:
-        row = db.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Record not found.")
+        existing = db.execute("SELECT * FROM weather_records WHERE id = ?", (record_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Weather record not found.")
 
-        if body.start_date is not None or body.end_date is not None:
-            start = body.start_date or date.fromisoformat(row["start_date"])
-            end = body.end_date or date.fromisoformat(row["end_date"])
-            validate_dates(start, end)
-            # Re-fetch temperatures so stored data matches the updated dates
-            temps = fetch_daily_temps(row["latitude"], row["longitude"], start, end)
-            temps_json = json.dumps(temps)
+        # Determine target dates
+        new_start = payload.start_date or date.fromisoformat(existing["start_date"])
+        new_end = payload.end_date or date.fromisoformat(existing["end_date"])
+
+        # If dates changed, re-fetch temperatures
+        if payload.start_date is not None or payload.end_date is not None:
+            validate_date_range(new_start, new_end)
+            new_temps = fetch_daily_temperatures(
+                existing["latitude"], existing["longitude"], new_start, new_end
+            )
+            temps_json = json.dumps(new_temps)
         else:
-            start = date.fromisoformat(row["start_date"])
-            end = date.fromisoformat(row["end_date"])
-            temps_json = row["temps"]
+            temps_json = existing["temps_json"]
 
-        note = body.note if body.note is not None else row["note"]
+        new_note = payload.note if payload.note is not None else existing["note"]
+
         db.execute(
-            "UPDATE records SET start_date=?, end_date=?, temps=?, note=? WHERE id=?",
-            (start.isoformat(), end.isoformat(), temps_json, note, record_id),
+            """
+            UPDATE weather_records
+            SET start_date = ?, end_date = ?, temps_json = ?, note = ?
+            WHERE id = ?
+            """,
+            (new_start.isoformat(), new_end.isoformat(), temps_json, new_note, record_id),
         )
-        row = db.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
-    return row_to_dict(row)
+        updated_row = db.execute("SELECT * FROM weather_records WHERE id = ?", (record_id,)).fetchone()
+
+    return record_row_to_dict(updated_row)
 
 
-@app.delete("/records/{record_id}")
-def delete_record(record_id: int):
+@app.delete("/records/{record_id}", summary="DELETE Weather Record")
+def delete_weather_record(record_id: int):
+    """DELETE: Removes a weather record from the database."""
     with get_db() as db:
-        cur = db.execute("DELETE FROM records WHERE id = ?", (record_id,))
-    if cur.rowcount == 0:
-        raise HTTPException(404, "Record not found.")
-    return {"deleted": record_id}
+        cursor = db.execute("DELETE FROM weather_records WHERE id = ?", (record_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Weather record not found.")
+    return {"message": "Record deleted successfully", "id": record_id}
 
 
-# ------------------------------------------------------------------ Export
-@app.get("/export/{fmt}")
-def export_records(fmt: str):
+# ==============================================================================
+# 8. API ROUTES - ENRICHMENT & EXPORT (TECH ASSESSMENT #2.2 & #2.3)
+# ==============================================================================
+
+@app.get("/records/{record_id}/extras", summary="External API Integration")
+def get_record_extras(record_id: int):
+    """
+    Section 2.2 Integration:
+    Provides Google Maps link, YouTube search link, and Wikipedia summary for the record's location.
+    """
     with get_db() as db:
-        rows = db.execute("SELECT * FROM records ORDER BY id").fetchall()
-    records = [row_to_dict(r) for r in rows]
+        row = db.execute("SELECT * FROM weather_records WHERE id = ?", (record_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Weather record not found.")
 
+    city_name = row["location"].split(",")[0].strip()
+    maps_url = f"https://www.google.com/maps?q={row['latitude']},{row['longitude']}"
+    youtube_url = f"https://www.youtube.com/results?search_query={quote(city_name + ' travel')}"
+
+    # Query Wikipedia REST API for background summary
+    wiki_summary = None
+    try:
+        wiki_res = httpx.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(city_name)}",
+            headers={"User-Agent": "WeatherApp-ChennoufiDjebril/1.0"},
+            timeout=6.0,
+            follow_redirects=True,
+        )
+        if wiki_res.status_code == 200:
+            wiki_summary = wiki_res.json().get("extract")
+    except httpx.HTTPError:
+        pass  # Graceful fallback: do not crash if Wikipedia is unreachable
+
+    return {
+        "location": row["location"],
+        "google_maps_url": maps_url,
+        "youtube_search_url": youtube_url,
+        "wikipedia_summary": wiki_summary,
+    }
+
+
+@app.get("/export/{fmt}", summary="Export Records (JSON, CSV, XML, PDF, Markdown)")
+def export_database_records(fmt: str):
+    """
+    Section 2.3: Exports stored weather records into JSON, CSV, XML, PDF, or Markdown formats.
+    """
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM weather_records ORDER BY id ASC").fetchall()
+    records = [record_row_to_dict(r) for r in rows]
+
+    fmt = fmt.lower()
+
+    # --- JSON Export ---
     if fmt == "json":
         return Response(
-            json.dumps(records, indent=2),
+            content=json.dumps(records, indent=2),
             media_type="application/json",
-            headers={"Content-Disposition": "attachment; filename=weather.json"},
+            headers={"Content-Disposition": "attachment; filename=weather_records.json"},
         )
 
+    # --- CSV Export ---
     if fmt == "csv":
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["id", "location", "date", "max_temp", "min_temp", "note"])
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["record_id", "location", "date", "max_temp_c", "min_temp_c", "note"])
         for rec in records:
-            for t in rec["temps"]:
-                w.writerow([rec["id"], rec["location"], t["date"], t["max"], t["min"], rec["note"]])
+            for item in rec["temps"]:
+                writer.writerow([
+                    rec["id"],
+                    rec["location"],
+                    item["date"],
+                    item["max_temp"],
+                    item["min_temp"],
+                    rec["note"],
+                ])
         return Response(
-            buf.getvalue(),
+            content=output.getvalue(),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=weather.csv"},
+            headers={"Content-Disposition": "attachment; filename=weather_records.csv"},
         )
 
+    # --- XML Export ---
     if fmt == "xml":
-        root = ET.Element("records")
+        root = ET.Element("weather_records")
         for rec in records:
-            e = ET.SubElement(root, "record", id=str(rec["id"]))
-            for k in ("location", "latitude", "longitude", "start_date", "end_date", "note"):
-                ET.SubElement(e, k).text = str(rec[k])
-            temps = ET.SubElement(e, "temps")
+            item_elem = ET.SubElement(root, "record", id=str(rec["id"]))
+            ET.SubElement(item_elem, "location").text = str(rec["location"])
+            ET.SubElement(item_elem, "start_date").text = str(rec["start_date"])
+            ET.SubElement(item_elem, "end_date").text = str(rec["end_date"])
+            ET.SubElement(item_elem, "note").text = str(rec["note"] or "")
+            temps_elem = ET.SubElement(item_elem, "temperatures")
             for t in rec["temps"]:
                 ET.SubElement(
-                    temps, "day", date=t["date"], max=str(t["max"]), min=str(t["min"])
+                    temps_elem,
+                    "day",
+                    date=str(t["date"]),
+                    max=str(t["max_temp"]),
+                    min=str(t["min_temp"]),
                 )
+        xml_string = ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
         return Response(
-            ET.tostring(root, encoding="unicode"),
+            content=xml_string,
             media_type="application/xml",
-            headers={"Content-Disposition": "attachment; filename=weather.xml"},
+            headers={"Content-Disposition": "attachment; filename=weather_records.xml"},
         )
 
-    if fmt == "md":
-        lines = ["# Weather Records", ""]
+    # --- Markdown Export ---
+    if fmt == "md" or fmt == "markdown":
+        lines = ["# Weather Database Export", "", f"Total Records: {len(records)}", ""]
         for rec in records:
-            lines.append(f"## {rec['location']} ({rec['start_date']} to {rec['end_date']})")
+            lines.append(f"## #{rec['id']} - {rec['location']}")
+            lines.append(f"**Period:** {rec['start_date']} to {rec['end_date']}")
             if rec["note"]:
-                lines.append(f"*{rec['note']}*")
-            lines += ["", "| Date | Max C | Min C |", "|---|---|---|"]
-            lines += [f"| {t['date']} | {t['max']} | {t['min']} |" for t in rec["temps"]]
+                lines.append(f"**Note:** {rec['note']}")
+            lines.append("")
+            lines.append("| Date | Max Temp (°C) | Min Temp (°C) |")
+            lines.append("| --- | --- | --- |")
+            for t in rec["temps"]:
+                lines.append(f"| {t['date']} | {t['max_temp']} | {t['min_temp']} |")
             lines.append("")
         return Response(
-            "\n".join(lines),
+            content="\n".join(lines),
             media_type="text/markdown",
-            headers={"Content-Disposition": "attachment; filename=weather.md"},
+            headers={"Content-Disposition": "attachment; filename=weather_records.md"},
         )
 
+    # --- PDF Export ---
     if fmt == "pdf":
-        def clean(text) -> str:
-            # built-in PDF fonts only support latin-1 characters
+        def sanitize_for_pdf(text: str) -> str:
+            # Standard PDF Helvetica font supports Latin-1 character set
             return str(text).encode("latin-1", "replace").decode("latin-1")
 
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "Weather Records", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 10, "Weather Application - Data Export", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", size=10)
-        pdf.cell(0, 6, "Generated by Chennoufi Djebril's Weather App", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(
+            0,
+            6,
+            "Developed by Chennoufi Djebril for PM Accelerator AI Engineer Assessment",
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+        pdf.ln(4)
+
         for rec in records:
-            pdf.ln(4)
             pdf.set_font("Helvetica", "B", 11)
-            pdf.multi_cell(0, 6, clean(f"#{rec['id']} {rec['location']}"), new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("Helvetica", size=10)
-            pdf.cell(0, 5, clean(f"{rec['start_date']} to {rec['end_date']}"), new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(
+                0,
+                6,
+                sanitize_for_pdf(f"#{rec['id']} {rec['location']} ({rec['start_date']} to {rec['end_date']})"),
+                new_x="LMARGIN",
+                new_y="NEXT",
+            )
+            pdf.set_font("Helvetica", size=9)
             if rec.get("note"):
-                pdf.multi_cell(0, 5, clean(f"Note: {rec['note']}"), new_x="LMARGIN", new_y="NEXT")
-            for t in rec.get("temps", []):
-                pdf.cell(0, 5, clean(f"  {t['date']}:  max {t['max']} C   min {t['min']} C"),
-                         new_x="LMARGIN", new_y="NEXT")
+                pdf.multi_cell(0, 5, sanitize_for_pdf(f"Note: {rec['note']}"), new_x="LMARGIN", new_y="NEXT")
+
+            temps_line = ", ".join([f"{t['date']}: {t['min_temp']}C-{t['max_temp']}C" for t in rec["temps"]])
+            pdf.multi_cell(0, 5, sanitize_for_pdf(f"Temps: {temps_line}"), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(3)
+
         return Response(
-            bytes(pdf.output()),
+            content=bytes(pdf.output()),
             media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=weather.pdf"},
+            headers={"Content-Disposition": "attachment; filename=weather_records.pdf"},
         )
 
-    raise HTTPException(400, "Format must be json, csv, xml, pdf or md.")
+    raise HTTPException(status_code=400, detail="Invalid format. Supported formats: json, csv, xml, md, pdf.")
 
 
-# --------------------------------------------------------- Extra API usage
-@app.get("/records/{record_id}/extras")
-def record_extras(record_id: int):
-    rec = get_record(record_id)
-    city = rec["location"].split(",")[0].strip()
-    map_link = f"https://www.google.com/maps?q={rec['latitude']},{rec['longitude']}"
+# ==============================================================================
+# 9. ROOT / HOMEPAGE WITH REQUIRED PM ACCELERATOR DESCRIPTION
+# ==============================================================================
 
-    summary = None
-    try:
-        r = httpx.get(
-            f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(city, safe='')}",
-            headers=HEADERS,
-            timeout=10,
-            follow_redirects=True,
-        )
-        if r.status_code == 200:
-            summary = r.json().get("extract")
-    except httpx.HTTPError:
-        pass  # extras are optional; never fail the request because of them
-
-    return {
-        "google_maps_link": map_link,
-        "youtube_search_link": f"https://www.youtube.com/results?search_query={quote(city + ' travel')}",
-        "wikipedia_summary": summary,
-    }
-
-
-# -------------------------------------------------------------- Home page
-@app.get("/", response_class=HTMLResponse)
-def home():
+@app.get("/", response_class=HTMLResponse, summary="API Home")
+def root_home():
     return """
-    <html><head><title>Weather App</title></head>
-    <body style="font-family: sans-serif; max-width: 700px; margin: 40px auto;">
-      <h1>Weather App</h1>
-      <p>Built by <b>Chennoufi Djebril</b> for the PM Accelerator AI Engineer Intern
-      technical assessment (Assessments #1 Frontend &amp; #2 Backend - Full Stack).</p>
-      <h3>About PM Accelerator</h3>
-      <p>PM Accelerator is a US-based company with a global reach, focused on AI
-      learning and acting as a development hub for AI products. It offers an
-      AI PM Bootcamp with hands-on experience, mentorship from professionals at
-      top tech companies, and real-world projects.</p>
-      <h3>Try it</h3>
-      <ul>
-        <li><a href="/docs">Interactive API docs (Swagger UI)</a></li>
-        <li><a href="/weather?location=Oran">Current weather: Oran</a></li>
-        <li><a href="/records">All saved records</a></li>
-        <li>Export: <a href="/export/json">JSON</a> |
-            <a href="/export/csv">CSV</a> |
-            <a href="/export/xml">XML</a> |
-            <a href="/export/pdf">PDF</a> |
-            <a href="/export/md">Markdown</a></li>
-      </ul>
-    </body></html>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Weather App API - Chennoufi Djebril</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 20px; color: #1e293b; line-height: 1.6; }
+            h1 { color: #0f172a; margin-bottom: 4px; }
+            .badge { display: inline-block; background: #e2e8f0; padding: 3px 8px; border-radius: 6px; font-size: 0.85em; font-weight: 600; }
+            .card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin: 20px 0; }
+            a { color: #2563eb; text-decoration: none; font-weight: 500; }
+            a:hover { text-decoration: underline; }
+            ul { padding-left: 20px; }
+        </style>
+    </head>
+    <body>
+        <h1>Weather Application API</h1>
+        <p><span class="badge">Full Stack Assessment #1 &amp; #2</span> Built by <strong>Chennoufi Djebril</strong></p>
+        
+        <div class="card">
+            <h3>About PM Accelerator</h3>
+            <p>PM Accelerator is a US-based company with a global reach, focused on AI learning and acting as a development hub for AI products. It offers an AI PM Bootcamp with hands-on experience, mentorship from professionals at top tech companies, and real-world projects.</p>
+        </div>
+
+        <h3>Quick Links &amp; Documentation</h3>
+        <ul>
+            <li><a href="/docs">Interactive API Documentation (Swagger UI)</a></li>
+            <li><a href="/weather?location=Oran">Current Weather Example (Oran)</a></li>
+            <li><a href="/forecast?location=Oran">5-Day Forecast Example (Oran)</a></li>
+            <li><a href="/records">Saved Database Records (SQLite)</a></li>
+            <li>Exports: 
+                <a href="/export/json">JSON</a> | 
+                <a href="/export/csv">CSV</a> | 
+                <a href="/export/xml">XML</a> | 
+                <a href="/export/md">Markdown</a> | 
+                <a href="/export/pdf">PDF</a>
+            </li>
+        </ul>
+    </body>
+    </html>
     """
