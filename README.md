@@ -148,3 +148,4 @@ weather-app/
 - **Tech Assessment #1 (Frontend):** Completed
 - **Tech Assessment #2 (Backend):** Completed
 - **Candidate Priority:** Full Stack Candidate
+
